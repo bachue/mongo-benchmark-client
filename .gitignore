@@ -24,4 +24,4 @@ _testmain.go
 *.prof
 
 /mongo-benchmark-client
-/records
+/records.txt

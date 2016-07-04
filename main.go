@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
+	"math/rand"
 	"os"
 	"reflect"
+	"strings"
 	"time"
 
 	mgo "gopkg.in/mgo.v2"
@@ -18,14 +22,7 @@ var (
 	concurrency    int
 	count          int
 	command        string
-	index          = mgo.Index{
-		Name: "records_indexes",
-		Key: []string{
-			"data0", "data1", "data2", "data3", "data4", "data5", "data6", "data7", "data8", "data9",
-			"data10", "data11", "data12", "data13", "data14", "data15", "data16", "data17", "data18", "data19",
-		},
-		Background: true,
-	}
+	dataFilePath   string
 )
 
 func parseFlags() {
@@ -36,6 +33,7 @@ func parseFlags() {
 	flag.IntVar(&concurrency, "concurrency", 1, "Concurrency")
 	flag.IntVar(&count, "count", 1, "Count")
 	flag.StringVar(&command, "command", "", "Command (`insert`, `query`)")
+	flag.StringVar(&dataFilePath, "datafile", "records.txt", "The Datafile path to record or query")
 	flag.Parse()
 
 	if len(flag.Args()) > 0 {
@@ -53,6 +51,16 @@ func parseFlags() {
 		fmt.Fprintf(os.Stderr, "Usage: -collection must be specified\n")
 		os.Exit(1)
 	}
+
+	if concurrency <= 0 {
+		fmt.Fprintf(os.Stderr, "Usage: -concurrency must be greater than 0\n")
+		os.Exit(1)
+	}
+
+	if count < concurrency {
+		fmt.Fprintf(os.Stderr, "Usage: -count must be greater than or equal to -concurrency\n")
+		os.Exit(1)
+	}
 }
 
 func main() {
@@ -66,16 +74,11 @@ func main() {
 	session.SetMode(mgo.Eventual, true)
 	collection := session.DB(dbName).C(collectionName)
 
-	err = ensureIndex(collection)
-	if err != nil {
-		panic(err)
-	}
-
 	var datafile *os.File
 	if command == "insert" {
-		datafile, err = os.OpenFile("records", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		datafile, err = os.OpenFile(dataFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	} else if command == "query" {
-		datafile, err = os.OpenFile("records", os.O_RDONLY, 0)
+		datafile, err = os.OpenFile(dataFilePath, os.O_RDONLY, 0)
 	} else {
 		fmt.Fprintf(os.Stderr, "Invalid Command: %s\n", command)
 		os.Exit(1)
@@ -103,7 +106,7 @@ func main() {
 	} else if command == "insert" {
 		duration, succeed, failed = insertParallel(collection, datafile)
 	} else if command == "query" {
-		panic("not implemented")
+		duration, succeed, failed = queryParallel(collection, datafile)
 	} else {
 		fmt.Fprintf(os.Stderr, "Invalid Command: %s\n", command)
 		os.Exit(1)
@@ -117,10 +120,6 @@ func main() {
 	}
 }
 
-func ensureIndex(collection *mgo.Collection) error {
-	return collection.EnsureIndex(index)
-}
-
 func insertByBatch(collection *mgo.Collection, datafile *os.File) (duration time.Duration, err error) {
 	array := make([]interface{}, count)
 	for i := 0; i < count; i++ {
@@ -131,13 +130,13 @@ func insertByBatch(collection *mgo.Collection, datafile *os.File) (duration time
 	endTime := time.Now()
 	duration = endTime.Sub(beginTime)
 	for i := 0; i < count; i++ {
-		writeRecord(array[i].(*Record), datafile)
+		writeRecord(array[i].(map[string]string), datafile)
 	}
 	return
 }
 
 func insertParallel(collection *mgo.Collection, datafile *os.File) (duration time.Duration, succeed int, failed int) {
-	array := make([]*Record, count)
+	array := make([]map[string]string, count)
 	for i := 0; i < count; i++ {
 		array[i] = generateRecord()
 	}
@@ -157,7 +156,7 @@ func insertParallel(collection *mgo.Collection, datafile *os.File) (duration tim
 	return
 }
 
-func insertAsync(collection *mgo.Collection, inputs <-chan *Record, outputs chan<- time.Duration, errors chan<- string, datafile *os.File) {
+func insertAsync(collection *mgo.Collection, inputs <-chan map[string]string, outputs chan<- time.Duration, errors chan<- string, datafile *os.File) {
 	defer close(outputs)
 	defer close(errors)
 
@@ -179,18 +178,66 @@ func insertAsync(collection *mgo.Collection, inputs <-chan *Record, outputs chan
 	}
 }
 
-func prepareChannels() (inputs []chan *Record, outputs []chan time.Duration, errors []chan string) {
+func queryParallel(collection *mgo.Collection, datafile *os.File) (duration time.Duration, succeed int, failed int) {
+	array := make([]map[string]string, count)
+	for i := 0; i < count; i++ {
+		key, value, err := getLine(datafile)
+		if err != nil {
+			panic(err)
+		}
+		array[i] = make(map[string]string)
+		array[i][key] = value
+	}
+	inputs, outputs, errors := prepareChannels()
+	for i := 0; i < concurrency; i++ {
+		go queryAsync(collection, inputs[i], outputs[i], errors[i])
+	}
+	for i := 0; i < count; i++ {
+		inputs[i%concurrency] <- array[i]
+	}
+	for i := 0; i < concurrency; i++ {
+		close(inputs[i])
+	}
+	duration, succeed, failed = waitForCases(outputs, errors)
+	return
+}
+
+func prepareChannels() (inputs []chan map[string]string, outputs []chan time.Duration, errors []chan string) {
 	tasksPerChannel := 1 + (count-1)/concurrency
 
-	inputs = make([]chan *Record, concurrency)
+	inputs = make([]chan map[string]string, concurrency)
 	outputs = make([]chan time.Duration, concurrency)
 	errors = make([]chan string, concurrency)
 	for i := 0; i < concurrency; i++ {
-		inputs[i] = make(chan *Record, tasksPerChannel)
+		inputs[i] = make(chan map[string]string, tasksPerChannel)
 		outputs[i] = make(chan time.Duration, concurrency)
 		errors[i] = make(chan string, concurrency)
 	}
 	return
+}
+
+func queryAsync(collection *mgo.Collection, inputs <-chan map[string]string, outputs chan<- time.Duration, errors chan<- string) {
+	defer close(outputs)
+	defer close(errors)
+
+	for {
+		pair, moreJob := <-inputs
+		if moreJob {
+			beginTime := time.Now()
+			count, err := collection.Find(pair).Count()
+			endTime := time.Now()
+			if err != nil {
+				errors <- err.Error()
+			} else {
+				if count != 1 {
+					fmt.Fprintf(os.Stderr, "Failed to find record.\n")
+				}
+				outputs <- endTime.Sub(beginTime)
+			}
+		} else {
+			break
+		}
+	}
 }
 
 func waitForCases(outputs []chan time.Duration, errors []chan string) (durationSum time.Duration, succeed int, failed int) {
@@ -225,5 +272,49 @@ func waitForCases(outputs []chan time.Duration, errors []chan string) (durationS
 				return
 			}
 		}
+	}
+}
+
+func getLine(datafile *os.File) (key string, value string, err error) {
+	var (
+		stat    os.FileInfo
+		size    int64
+		buf     []byte = make([]byte, 300)
+		lineBuf []byte
+		line    string
+		results []string
+	)
+	stat, err = datafile.Stat()
+	if err != nil {
+		return
+	}
+	size = stat.Size()
+	for {
+		_, err = datafile.ReadAt(buf, rand.Int63n(size))
+		if err != nil {
+			return
+		}
+		bytesReader := bytes.NewReader(buf)
+		bufReader := bufio.NewReader(bytesReader)
+		lineBuf, _, err = bufReader.ReadLine()
+		if err != nil {
+			continue
+		}
+		line = string(lineBuf[:])
+		results = strings.SplitN(line, ":", 3)
+		if len(results) != 3 || len(results[2]) != 128 {
+			lineBuf, _, err = bufReader.ReadLine()
+			if err != nil {
+				continue
+			}
+			line = string(lineBuf[:])
+			results = strings.SplitN(line, ":", 3)
+			if len(results) != 3 || len(results[2]) != 128 {
+				continue
+			}
+		}
+		key = "data" + results[1]
+		value = results[2]
+		return
 	}
 }
