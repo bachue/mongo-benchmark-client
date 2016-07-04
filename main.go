@@ -73,6 +73,7 @@ func main() {
 	defer session.Close()
 	session.SetMode(mgo.Eventual, true)
 	collection := session.DB(dbName).C(collectionName)
+	ensureIndexes(collection)
 
 	var datafile *os.File
 	if command == "insert" {
@@ -117,6 +118,16 @@ func main() {
 	}
 	if succeed > 0 {
 		fmt.Printf("Benchmark: %f q/s\n", float64(succeed*10e9)/float64(duration))
+	}
+}
+
+func ensureIndexes(collection *mgo.Collection) {
+	var err error
+	for i := 0; i < 20; i++ {
+		err = collection.EnsureIndexKey(fmt.Sprintf("data%d", i))
+		if err != nil {
+			panic(err)
+		}
 	}
 }
 
