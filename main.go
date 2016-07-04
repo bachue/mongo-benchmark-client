@@ -4,34 +4,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"reflect"
 	"time"
 
-	"github.com/tuvistavie/securerandom"
 	mgo "gopkg.in/mgo.v2"
 )
-
-type Record struct {
-	data0  string
-	data1  string
-	data2  string
-	data3  string
-	data4  string
-	data5  string
-	data6  string
-	data7  string
-	data8  string
-	data9  string
-	data10 string
-	data11 string
-	data12 string
-	data13 string
-	data14 string
-	data15 string
-	data16 string
-	data17 string
-	data18 string
-	data19 string
-}
 
 var (
 	url            string
@@ -94,12 +71,37 @@ func main() {
 		panic(err)
 	}
 
-	var duration time.Duration
+	var datafile *os.File
+	if command == "insert" {
+		datafile, err = os.OpenFile("records", os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	} else if command == "query" {
+		datafile, err = os.OpenFile("records", os.O_RDONLY, 0)
+	} else {
+		fmt.Fprintf(os.Stderr, "Invalid Command: %s\n", command)
+		os.Exit(1)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open datafile: %s\n", err.Error())
+		os.Exit(1)
+	}
+	defer datafile.Close()
+
+	var (
+		duration time.Duration
+		succeed  int
+		failed   int
+	)
 
 	if command == "insert" && batch {
-		duration, err = insertByBatch(collection)
+		duration, err = insertByBatch(collection, datafile)
+		if err != nil {
+			fmt.Fprint(os.Stderr, "Execute error: %s", err.Error())
+			os.Exit(1)
+		}
+		succeed = count
+		failed = 0
 	} else if command == "insert" {
-		panic("not implemented")
+		duration, succeed, failed = insertParallel(collection, datafile)
 	} else if command == "query" {
 		panic("not implemented")
 	} else {
@@ -107,19 +109,19 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err != nil {
-		fmt.Fprint(os.Stderr, "Execute error: %s", err.Error())
-		os.Exit(1)
+	if failed > 0 {
+		fmt.Printf("Error percent: %f %%\n", float64(failed)*100.0/float64(count))
 	}
-
-	fmt.Printf("Benchmark: %f q/s\n", float64(count*10e9)/float64(duration))
+	if succeed > 0 {
+		fmt.Printf("Benchmark: %f q/s\n", float64(succeed*10e9)/float64(duration))
+	}
 }
 
 func ensureIndex(collection *mgo.Collection) error {
 	return collection.EnsureIndex(index)
 }
 
-func insertByBatch(collection *mgo.Collection) (duration time.Duration, err error) {
+func insertByBatch(collection *mgo.Collection, datafile *os.File) (duration time.Duration, err error) {
 	array := make([]interface{}, count)
 	for i := 0; i < count; i++ {
 		array[i] = generateRecord()
@@ -128,39 +130,100 @@ func insertByBatch(collection *mgo.Collection) (duration time.Duration, err erro
 	err = collection.Insert(array...)
 	endTime := time.Now()
 	duration = endTime.Sub(beginTime)
-	return
-}
-
-func generateRecord() (record *Record) {
-	record = &Record{
-		data0:  generateRandomHex(64),
-		data1:  generateRandomHex(64),
-		data2:  generateRandomHex(64),
-		data3:  generateRandomHex(64),
-		data4:  generateRandomHex(64),
-		data5:  generateRandomHex(64),
-		data6:  generateRandomHex(64),
-		data7:  generateRandomHex(64),
-		data8:  generateRandomHex(64),
-		data9:  generateRandomHex(64),
-		data10: generateRandomHex(64),
-		data11: generateRandomHex(64),
-		data12: generateRandomHex(64),
-		data13: generateRandomHex(64),
-		data14: generateRandomHex(64),
-		data15: generateRandomHex(64),
-		data16: generateRandomHex(64),
-		data17: generateRandomHex(64),
-		data18: generateRandomHex(64),
-		data19: generateRandomHex(64),
+	for i := 0; i < count; i++ {
+		writeRecord(array[i].(*Record), datafile)
 	}
 	return
 }
 
-func generateRandomHex(n int) string {
-	random, err := securerandom.Hex(n)
-	if err != nil {
-		panic(err)
+func insertParallel(collection *mgo.Collection, datafile *os.File) (duration time.Duration, succeed int, failed int) {
+	array := make([]*Record, count)
+	for i := 0; i < count; i++ {
+		array[i] = generateRecord()
 	}
-	return random
+	inputs, outputs, errors := prepareChannels()
+
+	for i := 0; i < concurrency; i++ {
+		go insertAsync(collection, inputs[i], outputs[i], errors[i], datafile)
+	}
+
+	for i := 0; i < count; i++ {
+		inputs[i%concurrency] <- array[i]
+	}
+	for i := 0; i < concurrency; i++ {
+		close(inputs[i])
+	}
+	duration, succeed, failed = waitForCases(outputs, errors)
+	return
+}
+
+func insertAsync(collection *mgo.Collection, inputs <-chan *Record, outputs chan<- time.Duration, errors chan<- string, datafile *os.File) {
+	defer close(outputs)
+	defer close(errors)
+
+	for {
+		record, moreJob := <-inputs
+		if moreJob {
+			beginTime := time.Now()
+			err := collection.Insert(record)
+			endTime := time.Now()
+			if err != nil {
+				errors <- err.Error()
+			} else {
+				writeRecord(record, datafile)
+				outputs <- endTime.Sub(beginTime)
+			}
+		} else {
+			break
+		}
+	}
+}
+
+func prepareChannels() (inputs []chan *Record, outputs []chan time.Duration, errors []chan string) {
+	tasksPerChannel := 1 + (count-1)/concurrency
+
+	inputs = make([]chan *Record, concurrency)
+	outputs = make([]chan time.Duration, concurrency)
+	errors = make([]chan string, concurrency)
+	for i := 0; i < concurrency; i++ {
+		inputs[i] = make(chan *Record, tasksPerChannel)
+		outputs[i] = make(chan time.Duration, concurrency)
+		errors[i] = make(chan string, concurrency)
+	}
+	return
+}
+
+func waitForCases(outputs []chan time.Duration, errors []chan string) (durationSum time.Duration, succeed int, failed int) {
+	var done int
+
+	cases := make([]reflect.SelectCase, concurrency+concurrency)
+	for i := 0; i < concurrency; i++ {
+		cases[i] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(outputs[i])}
+	}
+	for i := 0; i < concurrency; i++ {
+		cases[i+concurrency] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(errors[i])}
+	}
+
+	durationSum = 0
+	succeed = 0
+	failed = 0
+	done = 0
+
+	for {
+		chosen, value, ok := reflect.Select(cases)
+		if ok {
+			if chosen < concurrency {
+				durationSum += time.Duration(value.Int())
+				succeed += 1
+			} else {
+				fmt.Fprintf(os.Stderr, "%d: %s\n", chosen-concurrency, value.String())
+				failed += 1
+			}
+		} else {
+			done += 1
+			if done >= count {
+				return
+			}
+		}
+	}
 }
